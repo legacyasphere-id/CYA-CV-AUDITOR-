@@ -148,89 +148,190 @@ Rules:
 - Keep each string concise and actionable. Avoid vague or generic statements.
 - Arrays should contain 2–5 items unless the CV genuinely warrants more or fewer.`
 
+// Attempt to parse JSON from Claude output robustly.
+// Claude occasionally wraps output in markdown code blocks despite instructions.
+function extractJSON(raw: string): Record<string, unknown> {
+  const text = raw.trim()
+
+  // Direct parse
+  try { return JSON.parse(text) } catch {}
+
+  // Strip markdown code block wrapper
+  const blockMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/)
+  if (blockMatch) {
+    try { return JSON.parse(blockMatch[1].trim()) } catch {}
+  }
+
+  // Find outermost JSON object
+  const objMatch = text.match(/\{[\s\S]*\}/)
+  if (objMatch) {
+    try { return JSON.parse(objMatch[0]) } catch {}
+  }
+
+  throw new Error('AI menghasilkan output yang tidak valid (bukan JSON)')
+}
+
+function validateAuditResult(result: Record<string, unknown>): void {
+  const required = ['first_impression', 'strengths', 'weaknesses', 'missing_opportunities', 'ats_review', 'recruiter_verdict', 'action_plan']
+  for (const key of required) {
+    if (!(key in result)) throw new Error(`Output AI tidak lengkap: field '${key}' tidak ditemukan`)
+  }
+  const ap = result.action_plan as Record<string, unknown>
+  if (!ap?.high_priority || !ap?.medium_priority || !ap?.low_priority) {
+    throw new Error("Output AI tidak lengkap: action_plan tidak valid")
+  }
+}
+
+async function markFailed(supabase: ReturnType<typeof createClient>, auditId: string, reason: string) {
+  await supabase
+    .from('audits')
+    .update({ status: 'failed', failure_reason: reason })
+    .eq('id', auditId)
+}
+
 serve(async (req) => {
+  let auditId: string | null = null
+
   try {
-    const { audit_id } = await req.json()
-    if (!audit_id) return new Response('audit_id required', { status: 400 })
+    const body = await req.json()
+    auditId = body.audit_id
+    if (!auditId) return new Response('audit_id required', { status: 400 })
 
     const supabase = createClient(
       Deno.env.get('SUPABASE_URL')!,
       Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
     )
 
-    // Fetch audit record
-    const { data: audit, error } = await supabase
+    // Fetch audit — reject if already completed or failed (idempotent guard)
+    const { data: audit, error: fetchError } = await supabase
       .from('audits')
-      .select('id, target_role, experience_level, cv_storage_path, cv_text')
-      .eq('id', audit_id)
+      .select('id, target_role, experience_level, cv_storage_path, cv_text, status')
+      .eq('id', auditId)
       .single()
 
-    if (error || !audit) return new Response('Audit not found', { status: 404 })
+    if (fetchError || !audit) return new Response('Audit not found', { status: 404 })
+    if (audit.status === 'completed') return new Response('Already completed', { status: 200 })
+    if (audit.status === 'failed')    return new Response('Already failed', { status: 200 })
 
     // Mark as processing
     await supabase
       .from('audits')
       .update({ status: 'processing' })
-      .eq('id', audit_id)
+      .eq('id', auditId)
 
-    // Extract CV text from storage if not already stored
+    // ── Step 1: Resolve CV text ──────────────────────────────────────────
     let cvText = audit.cv_text
-    if (!cvText && audit.cv_storage_path) {
-      const { data: fileData } = await supabase.storage
+
+    if (!cvText) {
+      if (!audit.cv_storage_path) {
+        await markFailed(supabase, auditId, 'CV storage path tidak ditemukan')
+        return new Response('No CV path', { status: 422 })
+      }
+
+      const { data: fileBlob, error: storageError } = await supabase.storage
         .from('cv-files')
         .download(audit.cv_storage_path)
 
-      if (fileData) {
-        // Basic text extraction — for V1 we send raw bytes as text
-        // Production: use a proper PDF parsing service
-        const arrayBuffer = await fileData.arrayBuffer()
-        const text = new TextDecoder('utf-8', { fatal: false }).decode(arrayBuffer)
-        // Strip binary artifacts, keep readable chars
-        cvText = text.replace(/[^\x20-\x7E\n\r\tÀ-ɏ]/g, ' ').trim()
-
-        await supabase
-          .from('audits')
-          .update({ cv_text: cvText })
-          .eq('id', audit_id)
+      if (storageError || !fileBlob) {
+        await markFailed(supabase, auditId, `Gagal mengambil file CV dari storage: ${storageError?.message ?? 'unknown'}`)
+        return new Response('Storage error', { status: 500 })
       }
+
+      const arrayBuffer = await fileBlob.arrayBuffer()
+      const raw = new TextDecoder('utf-8', { fatal: false }).decode(arrayBuffer)
+      // Strip binary/non-printable characters while keeping Latin + common Unicode
+      cvText = raw.replace(/[^\x09\x0A\x0D\x20-\x7E\xA0-￿]/g, ' ')
+        .replace(/\s{3,}/g, '  ')
+        .trim()
+
+      if (cvText.length < 100) {
+        await markFailed(supabase, auditId, 'Gagal mengekstrak teks dari PDF — file mungkin berupa gambar atau terenkripsi')
+        return new Response('CV text too short', { status: 422 })
+      }
+
+      // Cache extracted text
+      await supabase
+        .from('audits')
+        .update({ cv_text: cvText })
+        .eq('id', auditId)
     }
 
-    // Call Claude API
+    // ── Step 2: Call Claude API ──────────────────────────────────────────
     const anthropic = new Anthropic({
-      apiKey: Deno.env.get('ANTHROPIC_API_KEY')!,
+      apiKey:  Deno.env.get('ANTHROPIC_API_KEY')!,
+      timeout: 55_000, // 55s — stay within Supabase Edge 60s limit
     })
 
     const userMessage = JSON.stringify({
       target_role:      audit.target_role,
       experience_level: audit.experience_level,
-      cv_text:          cvText ?? 'CV text tidak tersedia.',
+      cv_text:          cvText,
     })
 
-    const message = await anthropic.messages.create({
-      model:      'claude-sonnet-4-6',
-      max_tokens: 2048,
-      system:     SYSTEM_PROMPT,
-      messages:   [{ role: 'user', content: userMessage }],
-    })
+    let rawContent: string
+    try {
+      const message = await anthropic.messages.create({
+        model:      'claude-sonnet-4-6',
+        max_tokens: 2048,
+        system:     SYSTEM_PROMPT,
+        messages:   [{ role: 'user', content: userMessage }],
+      })
 
-    const rawContent = message.content[0].type === 'text' ? message.content[0].text : ''
-    const result = JSON.parse(rawContent)
+      if (message.content[0]?.type !== 'text') {
+        throw new Error('Respons Claude bukan teks')
+      }
+      rawContent = message.content[0].text
+    } catch (apiErr) {
+      const msg = apiErr instanceof Error ? apiErr.message : String(apiErr)
+      const reason = msg.includes('timeout') || msg.includes('Timeout')
+        ? 'Claude API timeout — coba lagi beberapa saat'
+        : `Claude API error: ${msg}`
+      await markFailed(supabase, auditId, reason)
+      return new Response(reason, { status: 502 })
+    }
 
-    // Store result and mark completed
-    await supabase
+    // ── Step 3: Parse and validate JSON ─────────────────────────────────
+    let result: Record<string, unknown>
+    try {
+      result = extractJSON(rawContent)
+      validateAuditResult(result)
+    } catch (parseErr) {
+      const reason = parseErr instanceof Error ? parseErr.message : 'Output AI tidak valid'
+      await markFailed(supabase, auditId, reason)
+      return new Response(reason, { status: 422 })
+    }
+
+    // ── Step 4: Store result ─────────────────────────────────────────────
+    const { error: updateError } = await supabase
       .from('audits')
       .update({
         result,
         status:       'completed',
         completed_at: new Date().toISOString(),
       })
-      .eq('id', audit_id)
+      .eq('id', auditId)
+
+    if (updateError) {
+      await markFailed(supabase, auditId, `Gagal menyimpan hasil audit: ${updateError.message}`)
+      return new Response('DB update failed', { status: 500 })
+    }
 
     return new Response(JSON.stringify({ success: true }), {
       headers: { 'Content-Type': 'application/json' },
     })
+
   } catch (err) {
-    console.error('run-audit error:', err)
-    return new Response(JSON.stringify({ error: err.message }), { status: 500 })
+    console.error('run-audit unhandled error:', err)
+    // Last-resort: try to mark failed if we have the audit ID
+    if (auditId) {
+      try {
+        const supabase = createClient(
+          Deno.env.get('SUPABASE_URL')!,
+          Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
+        )
+        await markFailed(supabase, auditId, `Unexpected error: ${err instanceof Error ? err.message : String(err)}`)
+      } catch {}
+    }
+    return new Response('Internal server error', { status: 500 })
   }
 })

@@ -15,7 +15,19 @@
         <p class="text-xs text-gray-600">Halaman ini akan otomatis diperbarui.</p>
       </div>
 
-      <!-- Error -->
+      <!-- Failed audit -->
+      <div v-else-if="audit?.status === 'failed'" class="text-center py-32 space-y-4 max-w-md mx-auto">
+        <div class="text-4xl">⚠️</div>
+        <h2 class="text-xl font-semibold text-red-400">Audit Gagal</h2>
+        <p class="text-gray-400 text-sm leading-relaxed">
+          {{ audit.failure_reason || 'Terjadi kesalahan saat memproses audit kamu.' }}
+        </p>
+        <RouterLink to="/audit" class="btn-primary inline-flex text-sm">
+          Coba Lagi
+        </RouterLink>
+      </div>
+
+      <!-- Fetch error -->
       <div v-else-if="fetchError" class="text-center py-32 space-y-3">
         <p class="text-red-400">{{ fetchError }}</p>
         <RouterLink to="/" class="text-sm text-brand-400 hover:underline">Kembali ke halaman utama</RouterLink>
@@ -149,7 +161,7 @@ const result = computed(() => audit.value?.result)
 async function fetchAudit() {
   const { data, error } = await supabase
     .from('audits')
-    .select('status, target_role, experience_level, result')
+    .select('status, target_role, experience_level, result, failure_reason')
     .eq('public_id', route.params.publicId)
     .single()
 
@@ -162,7 +174,7 @@ async function fetchAudit() {
   audit.value = data
   loading.value = false
 
-  if (data.status === 'completed') {
+  if (data.status === 'completed' || data.status === 'failed') {
     clearInterval(pollInterval)
   }
 }
