@@ -116,22 +116,34 @@
             </div>
             <div class="border-t border-gray-800 pt-2 flex justify-between font-semibold">
               <span>Total</span>
-              <span class="text-brand-400">Rp1.000</span>
+              <span class="text-brand-400">Rp10.000</span>
             </div>
           </div>
         </div>
 
-        <p v-if="error" class="text-sm text-red-400 text-center">{{ error }}</p>
-
-        <div class="flex gap-3">
-          <button @click="currentStep--" class="flex-1 px-4 py-3 rounded-xl border border-gray-700 text-sm text-gray-400 hover:border-gray-600 transition-colors">
-            ← Kembali
-          </button>
-          <button @click="submitAudit" :disabled="isSubmitting" class="btn-primary flex-1">
-            <span v-if="isSubmitting">Memproses...</span>
-            <span v-else>Bayar & Audit — Rp1.000</span>
-          </button>
+        <!-- Pending payment state -->
+        <div v-if="snapPending" class="card text-center space-y-3">
+          <div class="text-2xl">⏳</div>
+          <p class="font-semibold">Menunggu Konfirmasi Pembayaran</p>
+          <p class="text-sm text-gray-400">Selesaikan pembayaran di aplikasi bank atau e-wallet kamu.</p>
+          <RouterLink :to="`/result/${pendingPublicId}`" class="btn-primary block text-center">
+            Lihat Status Audit →
+          </RouterLink>
         </div>
+
+        <template v-else>
+          <p v-if="error" class="text-sm text-red-400 text-center">{{ error }}</p>
+
+          <div class="flex gap-3">
+            <button @click="currentStep--" class="flex-1 px-4 py-3 rounded-xl border border-gray-700 text-sm text-gray-400 hover:border-gray-600 transition-colors">
+              ← Kembali
+            </button>
+            <button @click="submitAudit" :disabled="isSubmitting" class="btn-primary flex-1">
+              <span v-if="isSubmitting">Memproses...</span>
+              <span v-else>Bayar & Audit — Rp10.000</span>
+            </button>
+          </div>
+        </template>
       </div>
 
     </div>
@@ -141,7 +153,6 @@
 <script setup>
 import { ref, reactive } from 'vue'
 import { useRouter, RouterLink } from 'vue-router'
-import { supabase } from '@/lib/supabase'
 
 const router = useRouter()
 
@@ -158,6 +169,8 @@ const form = reactive({
 const fileInput = ref(null)
 const isSubmitting = ref(false)
 const error = ref('')
+const snapPending = ref(false)
+const pendingPublicId = ref('')
 
 function nextStep() {
   if (currentStep.value < 3) currentStep.value++
@@ -186,7 +199,6 @@ async function submitAudit() {
     formData.append('experience_level', form.experienceLevel)
     formData.append('cv_file', form.file)
 
-    const { data: { session } } = await supabase.auth.getSession()
     const res = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/create-audit`, {
       method: 'POST',
       headers: {
@@ -200,16 +212,27 @@ async function submitAudit() {
       throw new Error(err.error || 'Gagal membuat audit.')
     }
 
-    const { public_id, payment_url } = await res.json()
+    const { public_id, snap_token } = await res.json()
+    pendingPublicId.value = public_id
 
-    if (payment_url) {
-      window.location.href = payment_url
-    } else {
-      router.push({ name: 'result', params: { publicId: public_id } })
-    }
+    window.snap.pay(snap_token, {
+      onSuccess() {
+        router.push({ name: 'result', params: { publicId: pendingPublicId.value } })
+      },
+      onPending() {
+        snapPending.value = true
+        isSubmitting.value = false
+      },
+      onError(result) {
+        error.value = result?.status_message || 'Pembayaran gagal. Coba lagi.'
+        isSubmitting.value = false
+      },
+      onClose() {
+        isSubmitting.value = false
+      },
+    })
   } catch (e) {
     error.value = e.message
-  } finally {
     isSubmitting.value = false
   }
 }
