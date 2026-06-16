@@ -9,6 +9,7 @@ const corsHeaders = {
 
 const VALID_EXPERIENCE_LEVELS = ['Fresh Graduate', 'Junior', 'Mid-Level', 'Senior'] as const
 const MAX_FILE_SIZE = 5 * 1024 * 1024 // 5MB
+const AUDIT_PRICE_IDR = 10_000
 
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -88,7 +89,6 @@ serve(async (req) => {
       .single()
 
     if (insertError || !audit) {
-      // Clean up orphaned storage file
       await supabase.storage.from('cv-files').remove([storagePath])
       console.error('Audit insert failed:', insertError)
       return json({ error: 'Gagal membuat audit. Coba lagi.' }, 500)
@@ -97,14 +97,14 @@ serve(async (req) => {
     auditId = audit.id
 
     // ── Step 4: Create payment record ───────────────────────────────────
-    const xenditExternalId = `cya-${publicId}`
+    const orderId = `cya-${publicId}`
 
     const { error: paymentInsertError } = await supabase
       .from('payments')
       .insert({
         audit_id:           auditId,
-        xendit_external_id: xenditExternalId,
-        amount:             1000,
+        xendit_external_id: orderId, // reused as order_id
+        amount:             AUDIT_PRICE_IDR,
         currency:           'IDR',
         status:             'pending',
       })
@@ -115,57 +115,63 @@ serve(async (req) => {
       return json({ error: 'Gagal menyiapkan pembayaran. Coba lagi.' }, 500)
     }
 
-    // Update audit to payment_pending
-    await supabase
-      .from('audits')
-      .update({ status: 'payment_pending' })
-      .eq('id', auditId)
+    await supabase.from('audits').update({ status: 'payment_pending' }).eq('id', auditId)
 
-    // ── Step 5: Create Xendit invoice ────────────────────────────────────
-    const xenditKey = Deno.env.get('XENDIT_SECRET_KEY')
-    if (!xenditKey) {
+    // ── Step 5: Create Midtrans Snap transaction ─────────────────────────
+    const midtransServerKey = Deno.env.get('MIDTRANS_SERVER_KEY')
+    if (!midtransServerKey) {
       await supabase.from('audits').update({ status: 'failed', failure_reason: 'Konfigurasi pembayaran tidak tersedia' }).eq('id', auditId)
       return json({ error: 'Sistem pembayaran belum dikonfigurasi.' }, 503)
     }
 
-    let xenditData: { id: string; invoice_url: string }
+    const isProduction = Deno.env.get('MIDTRANS_IS_PRODUCTION') === 'true'
+    const snapBaseUrl  = isProduction
+      ? 'https://app.midtrans.com/snap/v1/transactions'
+      : 'https://app.sandbox.midtrans.com/snap/v1/transactions'
+
+    let snapData: { token: string; redirect_url: string }
     try {
-      const xenditRes = await fetch('https://api.xendit.co/v2/invoices', {
+      const snapRes = await fetch(snapBaseUrl, {
         method:  'POST',
         headers: {
-          Authorization:  `Basic ${btoa(xenditKey + ':')}`,
+          Authorization:  `Basic ${btoa(midtransServerKey + ':')}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          external_id:          xenditExternalId,
-          amount:               1000,
-          currency:             'IDR',
-          description:          `Audit CV — ${targetRole}`,
-          success_redirect_url: `${Deno.env.get('APP_URL')}/result/${publicId}`,
-          failure_redirect_url: `${Deno.env.get('APP_URL')}/audit`,
-          invoice_duration:     86400, // 24 hours
+          transaction_details: {
+            order_id:     orderId,
+            gross_amount: AUDIT_PRICE_IDR,
+          },
+          item_details: [{
+            id:       'audit-cv',
+            price:    AUDIT_PRICE_IDR,
+            quantity: 1,
+            name:     `Audit CV — ${targetRole}`,
+          }],
+          credit_card: { secure: true },
+          callbacks: {
+            finish: `${Deno.env.get('APP_URL')}/result/${publicId}`,
+          },
         }),
       })
 
-      if (!xenditRes.ok) {
-        const errBody = await xenditRes.text()
-        throw new Error(`Xendit ${xenditRes.status}: ${errBody}`)
+      if (!snapRes.ok) {
+        const errBody = await snapRes.text()
+        throw new Error(`Midtrans ${snapRes.status}: ${errBody}`)
       }
-      xenditData = await xenditRes.json()
-    } catch (xenditErr) {
-      const reason = `Gagal membuat link pembayaran: ${xenditErr instanceof Error ? xenditErr.message : String(xenditErr)}`
+      snapData = await snapRes.json()
+    } catch (snapErr) {
+      const reason = `Gagal membuat sesi pembayaran: ${snapErr instanceof Error ? snapErr.message : String(snapErr)}`
       await supabase.from('audits').update({ status: 'failed', failure_reason: reason }).eq('id', auditId)
       console.error(reason)
-      return json({ error: 'Gagal membuat link pembayaran. Coba lagi.' }, 502)
+      return json({ error: 'Gagal membuat sesi pembayaran. Coba lagi.' }, 502)
     }
 
-    // Store Xendit payment ID
-    await supabase
-      .from('payments')
-      .update({ xendit_payment_id: xenditData.id })
-      .eq('xendit_external_id', xenditExternalId)
-
-    return json({ public_id: publicId, payment_url: xenditData.invoice_url })
+    return json({
+      public_id:    publicId,
+      snap_token:   snapData.token,
+      payment_url:  snapData.redirect_url,
+    })
 
   } catch (err) {
     console.error('create-audit unhandled error:', err)

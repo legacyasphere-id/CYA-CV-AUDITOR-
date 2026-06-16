@@ -1,41 +1,65 @@
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 
+async function sha512hex(input: string): Promise<string> {
+  const buf = await crypto.subtle.digest('SHA-512', new TextEncoder().encode(input))
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('')
+}
+
 serve(async (req) => {
-  // ── Security: Verify Xendit webhook token ────────────────────────────
-  const webhookToken = req.headers.get('x-callback-token')
-  const expectedToken = Deno.env.get('XENDIT_WEBHOOK_TOKEN')
-
-  if (!expectedToken) {
-    console.error('XENDIT_WEBHOOK_TOKEN not configured')
-    return new Response('Webhook not configured', { status: 503 })
-  }
-
-  if (webhookToken !== expectedToken) {
-    console.warn('Invalid webhook token received')
-    return new Response('Unauthorized', { status: 401 })
-  }
-
-  let payload: Record<string, unknown>
+  let payload: Record<string, string>
   try {
     payload = await req.json()
   } catch {
     return new Response('Invalid JSON payload', { status: 400 })
   }
 
-  const externalId     = payload.external_id as string | undefined
-  const status         = payload.status as string | undefined
-  const xenditPayId    = payload.id as string | undefined
-  const paymentMethod  = payload.payment_method as string | undefined
+  const {
+    order_id:           orderId,
+    transaction_status: txStatus,
+    transaction_id:     txId,
+    fraud_status:       fraudStatus,
+    status_code:        statusCode,
+    gross_amount:       grossAmount,
+    payment_type:       paymentType,
+    signature_key:      signatureKey,
+  } = payload
 
   // Only process CYA audits
-  if (!externalId?.startsWith('cya-')) {
+  if (!orderId?.startsWith('cya-')) {
     return new Response('Ignored — not a CYA audit', { status: 200 })
   }
 
-  if (!status || !xenditPayId) {
-    console.warn('Webhook missing required fields:', { externalId, status, xenditPayId })
-    return new Response('Missing required fields', { status: 400 })
+  // ── Security: Verify Midtrans signature ──────────────────────────────
+  const serverKey = Deno.env.get('MIDTRANS_SERVER_KEY')
+  if (!serverKey) {
+    console.error('MIDTRANS_SERVER_KEY not configured')
+    return new Response('Webhook not configured', { status: 503 })
+  }
+
+  const expectedSig = await sha512hex(orderId + statusCode + grossAmount + serverKey)
+  if (signatureKey !== expectedSig) {
+    console.warn('Invalid Midtrans signature for order:', orderId)
+    return new Response('Unauthorized', { status: 401 })
+  }
+
+  // ── Map Midtrans status → payment status ─────────────────────────────
+  const isSuccess =
+    txStatus === 'settlement' ||
+    (txStatus === 'capture' && fraudStatus === 'accept')
+
+  const isFailed  = txStatus === 'cancel' || txStatus === 'deny' || txStatus === 'expire'
+  const isPending = txStatus === 'pending'
+
+  if (isPending) {
+    // Pending = payment initiated but not confirmed yet — wait for settlement
+    console.log(`Payment pending for order ${orderId}`)
+    return new Response('OK', { status: 200 })
+  }
+
+  if (!isSuccess && !isFailed) {
+    console.log(`Unhandled Midtrans status '${txStatus}' for ${orderId}`)
+    return new Response('Acknowledged', { status: 200 })
   }
 
   const supabase = createClient(
@@ -43,43 +67,34 @@ serve(async (req) => {
     Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
   )
 
-  // Map Xendit status → our payment status
-  const paymentStatus =
-    status === 'PAID'    ? 'paid'    :
-    status === 'EXPIRED' ? 'expired' :
-    status === 'FAILED'  ? 'failed'  : null
-
-  if (!paymentStatus) {
-    // Unknown status — log and acknowledge (Xendit expects 200)
-    console.log(`Unhandled Xendit status '${status}' for ${externalId}`)
-    return new Response('Acknowledged', { status: 200 })
-  }
+  const paymentStatus = isSuccess ? 'paid' : txStatus === 'expire' ? 'expired' : 'failed'
 
   // ── Update payment record ────────────────────────────────────────────
   const { data: payment, error: paymentError } = await supabase
     .from('payments')
     .update({
       status:            paymentStatus,
-      xendit_payment_id: xenditPayId,
-      payment_method:    paymentMethod ?? null,
+      xendit_payment_id: txId ?? null,   // reused column for transaction_id
+      payment_method:    paymentType ?? null,
       webhook_payload:   payload,
     })
-    .eq('xendit_external_id', externalId)
+    .eq('xendit_external_id', orderId)   // reused column for order_id
     .select('audit_id')
     .single()
 
   if (paymentError || !payment) {
     console.error('Failed to update payment record:', paymentError)
-    // Return 200 to Xendit so it doesn't retry — we'll handle manually
+    // Return 200 so Midtrans does not retry
     return new Response('Payment record not found', { status: 200 })
   }
 
   const auditId = payment.audit_id
 
   // ── Handle non-paid outcomes ─────────────────────────────────────────
-  if (paymentStatus !== 'paid') {
+  if (!isSuccess) {
     const failureReason =
-      paymentStatus === 'expired' ? 'Pembayaran kadaluarsa' : 'Pembayaran gagal'
+      txStatus === 'expire' ? 'Pembayaran kadaluarsa' :
+      txStatus === 'cancel' ? 'Pembayaran dibatalkan'  : 'Pembayaran ditolak'
 
     await supabase
       .from('audits')
@@ -95,8 +110,6 @@ serve(async (req) => {
     .update({ status: 'payment_verified' })
     .eq('id', auditId)
 
-  // Fire-and-forget run-audit (webhook must respond quickly)
-  // Supabase Edge Function invocation is async — failure here won't affect webhook ACK
   try {
     const runAuditUrl = `${Deno.env.get('SUPABASE_URL')}/functions/v1/run-audit`
     const triggerRes = await fetch(runAuditUrl, {
@@ -111,11 +124,9 @@ serve(async (req) => {
     if (!triggerRes.ok) {
       const errText = await triggerRes.text()
       console.error(`run-audit trigger failed for audit ${auditId}:`, errText)
-      // Do NOT mark as failed here — run-audit handles its own failure states
     }
   } catch (err) {
     console.error('Failed to trigger run-audit:', err)
-    // run-audit can be triggered manually if this fails
   }
 
   return new Response('OK', { status: 200 })
